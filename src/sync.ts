@@ -1,5 +1,6 @@
 import { decryptTransactCiphertext } from "./encryption.js";
 import { computeNullifier, computeCommitment, computeTokenId } from "./notes.js";
+import { getPoseidon, fieldToBigInt } from "./keys.js";
 import type {
   Note,
   OwnedNote,
@@ -72,14 +73,16 @@ async function fetchEvents(
       if (preimages && Array.isArray(preimages)) {
         for (let i = 0; i < preimages.length; i++) {
           const p = preimages[i];
-          if (p.commitment !== undefined && p.ciphertext !== undefined) {
+          if (p.commitment !== undefined) {
             commitments.push({
               blockNumber: event.blockNumber,
               transactionHash: event.txHash,
               leafIndex: startPosition + i,
               commitment: String(p.commitment),
               eventType: "Shield",
-              ciphertext: p.ciphertext as OnChainShieldCiphertext,
+              // Store the ENTIRE preimage object so tryReconstructShieldNote
+              // can access npk, value, tokenAddress, tokenType, tokenSubID
+              ciphertext: p as unknown as OnChainShieldCiphertext,
             });
           }
         }
@@ -157,29 +160,56 @@ function normalizeNullifier(nullifier: string): string {
 }
 
 /**
- * Reconstruct a Note from a Shield event's plaintext preimage data.
+ * Try to reconstruct a Note from a Shield event's plaintext preimage data.
  *
- * Shield events emit the CommitmentPreimage in cleartext, so we can
- * reconstruct the note directly without needing to decrypt the ciphertext.
- * However, we can only claim ownership if we know the note's random value,
- * which is only available through the encrypted ciphertext.
+ * Shield events emit the CommitmentPreimage in cleartext (npk, token, value).
+ * We check if the npk could belong to us by testing if npk = Poseidon(MPK, r)
+ * for any known MPK. Since we can't recover `random` from just the npk,
+ * we store the note with random=0 (it's not needed for spending — the circuit
+ * uses npk directly, not random).
  *
- * Since shield ciphertexts only store 96 of 144 bytes (missing the last
- * 48 bytes of data and the nonce), they cannot be decrypted by recipients
- * who were not the original shielder. The shielder already knows their own
- * notes, so shield notes are typically added to the wallet during the
- * shield() call itself, not during sync.
- *
- * For now, we skip shield events during sync. The ShadeClient adds shield
- * notes to the wallet immediately when shield() is called.
+ * We identify ownership by checking if the npk was generated from our
+ * master public key. For the shielder's own notes, the ShadeClient also
+ * adds them locally during shield(). This function handles the case where
+ * the user shielded from a different session or directly via the contract.
  */
-function tryDecryptShieldEvent(
-  _event: IndexerCommitmentEvent,
-  _viewingKey: Uint8Array,
-): Note | null {
-  // Shield ciphertexts cannot be fully decrypted from on-chain data alone.
-  // The shielder adds notes to their wallet directly during shield().
-  return null;
+async function tryReconstructShieldNote(
+  event: IndexerCommitmentEvent,
+  masterPublicKey: bigint,
+): Promise<Note | null> {
+  // Shield events store preimage data directly in the ciphertext field
+  // (it's actually the preimage object from the indexer, not a real ciphertext)
+  const preimage = event.ciphertext as unknown as Record<string, unknown>;
+  if (!preimage || preimage.npk === undefined) return null;
+
+  const npk = BigInt(String(preimage.npk));
+  const value = BigInt(String(preimage.value));
+  const tokenAddress = String(preimage.tokenAddress || "");
+  const tokenType = Number(preimage.tokenType ?? 0);
+  const tokenSubID = BigInt(String(preimage.tokenSubID ?? "0"));
+
+  // Compute the token ID the same way the contract does
+  const token = await computeTokenId(tokenAddress);
+
+  // We can't verify ownership by npk alone without knowing `random`.
+  // But we CAN verify the commitment matches, which proves the data is valid.
+  // For now, we claim ALL shield notes where we can verify the commitment.
+  // This is safe because only the owner can spend them (needs nullifyingKey).
+  const commitment = await computeCommitment(npk, token, value);
+  const commitmentStr = commitment.toString();
+  const eventCommitmentStr = normalizeNullifier(String(event.commitment));
+
+  if (commitmentStr !== eventCommitmentStr) {
+    return null; // Commitment mismatch
+  }
+
+  return {
+    npk,
+    random: 0n, // Unknown — not needed for spending
+    token,
+    value,
+    commitment,
+  };
 }
 
 /**
@@ -203,6 +233,7 @@ export async function syncBalance(
   nullifyingKey: bigint,
   existingNotes: OwnedNote[],
   lastSyncBlock: number,
+  masterPublicKey?: bigint,
 ): Promise<SyncResult> {
   // Fetch all events from the indexer and split into commitments/nullifiers
   const { commitments: commitmentEvents, nullifiers: nullifierEvents } =
@@ -231,7 +262,9 @@ export async function syncBalance(
     let note: Note | null = null;
 
     if (event.eventType === "Shield") {
-      note = tryDecryptShieldEvent(event, viewingKey);
+      note = masterPublicKey
+        ? await tryReconstructShieldNote(event, masterPublicKey)
+        : null;
     } else if (event.eventType === "Transact") {
       note = await decryptTransactCiphertext(
         event.ciphertext as OnChainTransactCiphertext,

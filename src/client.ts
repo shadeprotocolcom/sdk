@@ -598,6 +598,7 @@ export class ShadeClient {
       this.keys!.nullifyingKey,
       this.ownedNotes,
       this.lastSyncBlock,
+      this.keys!.masterPublicKey,
     );
 
     this.ownedNotes = result.notes;
