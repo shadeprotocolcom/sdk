@@ -177,24 +177,39 @@ async function tryReconstructShieldNote(
   event: IndexerCommitmentEvent,
   masterPublicKey: bigint,
 ): Promise<Note | null> {
-  // Shield events store preimage data directly in the ciphertext field
-  // (it's actually the preimage object from the indexer, not a real ciphertext)
+  const { generateNotePublicKey } = await import("./keys.js");
+
+  // Shield events store preimage data in the ciphertext field
   const preimage = event.ciphertext as unknown as Record<string, unknown>;
   if (!preimage || preimage.npk === undefined) return null;
 
   const npk = BigInt(String(preimage.npk));
   const value = BigInt(String(preimage.value));
   const tokenAddress = String(preimage.tokenAddress || "");
-  const tokenType = Number(preimage.tokenType ?? 0);
-  const tokenSubID = BigInt(String(preimage.tokenSubID ?? "0"));
 
-  // Compute the token ID the same way the contract does
+  // Extract `random` from encryptedBundle[0] (stored by shield() since the fix)
+  const ct = preimage.ciphertext as Record<string, unknown> | undefined;
+  const encryptedBundle = ct?.encryptedBundle as string[] | undefined;
+  if (!encryptedBundle || !encryptedBundle[0]) return null;
+
+  const randomHex = encryptedBundle[0];
+  let random: bigint;
+  try {
+    random = BigInt(randomHex);
+  } catch {
+    return null; // Old format without random — can't recover
+  }
+
+  if (random === 0n) return null; // Zero means old format or padding
+
+  // Verify ownership: check if NPK = Poseidon(MPK, random) for OUR master public key
+  const expectedNpk = await generateNotePublicKey(masterPublicKey, random);
+  if (expectedNpk !== npk) {
+    return null; // Not our note
+  }
+
+  // Compute token ID and commitment
   const token = await computeTokenId(tokenAddress);
-
-  // We can't verify ownership by npk alone without knowing `random`.
-  // But we CAN verify the commitment matches, which proves the data is valid.
-  // For now, we claim ALL shield notes where we can verify the commitment.
-  // This is safe because only the owner can spend them (needs nullifyingKey).
   const commitment = await computeCommitment(npk, token, value);
   const commitmentStr = commitment.toString();
   const eventCommitmentStr = normalizeNullifier(String(event.commitment));
@@ -203,13 +218,7 @@ async function tryReconstructShieldNote(
     return null; // Commitment mismatch
   }
 
-  return {
-    npk,
-    random: 0n, // Unknown — not needed for spending
-    token,
-    value,
-    commitment,
-  };
+  return { npk, random, token, value, commitment };
 }
 
 /**
@@ -262,6 +271,8 @@ export async function syncBalance(
     let note: Note | null = null;
 
     if (event.eventType === "Shield") {
+      // Reconstruct shield notes from on-chain preimage data.
+      // The `random` value is stored in encryptedBundle[0] of the shield ciphertext.
       note = masterPublicKey
         ? await tryReconstructShieldNote(event, masterPublicKey)
         : null;
@@ -270,6 +281,18 @@ export async function syncBalance(
         event.ciphertext as OnChainTransactCiphertext,
         viewingKey,
       );
+
+      // Verify NPK ownership for Transact outputs. Unshield outputs have
+      // npk = BigInt(recipientAddress) instead of Poseidon(MPK, random).
+      // These are NOT inserted into the Merkle tree by the contract, so
+      // treating them as owned notes would cause Merkle proof failures.
+      if (note !== null && masterPublicKey) {
+        const { generateNotePublicKey } = await import("./keys.js");
+        const expectedNpk = await generateNotePublicKey(masterPublicKey, note.random);
+        if (expectedNpk !== note.npk) {
+          note = null; // Not our note or unshield output — skip
+        }
+      }
     }
 
     if (note === null) {

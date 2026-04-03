@@ -124,6 +124,56 @@ export class ShadeClient {
   }
 
   // -----------------------------------------------------------------------
+  // Note persistence (for cross-session recovery)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Export owned notes as a JSON string for localStorage persistence.
+   */
+  exportNotes(): string {
+    return JSON.stringify(
+      this.ownedNotes.map((n) => ({
+        npk: n.npk.toString(),
+        random: n.random.toString(),
+        token: n.token.toString(),
+        value: n.value.toString(),
+        commitment: n.commitment.toString(),
+        leafIndex: n.leafIndex,
+        nullifier: n.nullifier.toString(),
+        spent: n.spent,
+      })),
+    );
+  }
+
+  /**
+   * Import previously exported notes (from localStorage).
+   * Merges with existing notes, avoiding duplicates by leafIndex.
+   */
+  importNotes(json: string): void {
+    try {
+      const parsed = JSON.parse(json) as Array<Record<string, unknown>>;
+      for (const n of parsed) {
+        const leafIndex = Number(n.leafIndex);
+        if (this.ownedNotes.some((existing) => existing.leafIndex === leafIndex)) {
+          continue; // Skip duplicates
+        }
+        this.ownedNotes.push({
+          npk: BigInt(String(n.npk)),
+          random: BigInt(String(n.random)),
+          token: BigInt(String(n.token)),
+          value: BigInt(String(n.value)),
+          commitment: BigInt(String(n.commitment)),
+          leafIndex,
+          nullifier: BigInt(String(n.nullifier)),
+          spent: Boolean(n.spent),
+        });
+      }
+    } catch {
+      // Invalid JSON, ignore
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // Public key access
   // -----------------------------------------------------------------------
 
@@ -215,16 +265,20 @@ export class ShadeClient {
         value: amount,
       },
       ciphertext: {
-        // Pack encrypted data into 3 x bytes32 (96 bytes).
-        // The full XChaCha20-Poly1305 output is 144 bytes; the first 96 go
-        // into encryptedBundle. Remaining bytes + nonce are recoverable
-        // from the shieldKey field and on-chain event data.
+        // Store the note's `random` value directly in encryptedBundle[0].
+        // This allows recovery during sync — the random is needed to derive
+        // NPK = Poseidon(MPK, random) which the circuit verifies.
+        // encryptedBundle[1] stores the ephemeral pub key Y coordinate.
+        // encryptedBundle[2] stores the nonce (first 24 bytes, zero-padded).
+        // The actual encrypted payload is NOT needed for shield notes because
+        // the preimage (npk, token, value) is emitted in cleartext in the event.
+        // We just need `random` for spending.
         encryptedBundle: [
-          bytesToHex(ciphertext.data.slice(0, 32)),
-          bytesToHex(ciphertext.data.slice(32, 64)),
-          bytesToHex(ciphertext.data.slice(64, 96)),
+          "0x" + note.random.toString(16).padStart(64, "0"),
+          "0x" + ciphertext.ephemeralPubKey[1].toString(16).padStart(64, "0"),
+          bytesToHex(new Uint8Array(32)), // padding
         ],
-        // Store ephemeral public key x-coordinate for ECDH reconstruction
+        // Store ephemeral public key x-coordinate
         shieldKey: bytesToHex(bigIntToBytes32(ciphertext.ephemeralPubKey[0])),
       },
     };
@@ -383,13 +437,18 @@ export class ShadeClient {
     // Generate proof
     const proof = await generateProof(witness, this.config.proverUrl);
 
+    // Use nullifiers and commitments from the witness (includes padded dummies).
+    // The contract expects exactly 2 of each, matching the 2-in-2-out circuit.
+    const allNullifiers = witness.nullifiers.map((n) => BigInt(n));
+    const allCommitments = witness.commitmentsOut.map((c) => BigInt(c));
+
     // Submit transaction
     return this.submitTransact(
       proof,
       merkleTree.root,
       boundParamsHash,
-      selected.map((n) => n.nullifier),
-      outputNotes.map((n) => n.commitment),
+      allNullifiers,
+      allCommitments,
       ciphertexts,
       ethers.ZeroAddress,
       0n,
@@ -500,12 +559,16 @@ export class ShadeClient {
 
     const proof = await generateProof(witness, this.config.proverUrl);
 
+    // Use nullifiers and commitments from the witness (includes padded dummies).
+    const allNullifiers = witness.nullifiers.map((n) => BigInt(n));
+    const allCommitments = witness.commitmentsOut.map((c) => BigInt(c));
+
     return this.submitTransact(
       proof,
       merkleTree.root,
       boundParamsHash,
-      selected.map((n) => n.nullifier),
-      outputNotes.map((n) => n.commitment),
+      allNullifiers,
+      allCommitments,
       ciphertexts,
       toAddress,
       amount,
@@ -710,6 +773,7 @@ export class ShadeClient {
    */
   private async prepareMerkleTree(
     leafIndices: number[],
+    inputNotes?: OwnedNote[],
   ): Promise<MerkleTree> {
     const baseUrl = this.config.indexerUrl.replace(/\/+$/, "");
 
@@ -725,13 +789,36 @@ export class ShadeClient {
     };
     const root = BigInt(rootData.root);
 
-    // Pre-fetch all needed proofs in parallel
-    const proofPromises = leafIndices.map((idx) => this.fetchMerkleProof(idx));
+    // Identify which leaf indices are dummy notes (value=0).
+    // Dummy notes don't need real Merkle proofs because the circuit
+    // skips the Merkle check when valueIn[i] == 0.
+    const dummyIndices = new Set<number>();
+    if (inputNotes) {
+      for (const note of inputNotes) {
+        if (note.value === 0n) {
+          dummyIndices.add(note.leafIndex);
+        }
+      }
+    }
+
+    // Only fetch proofs for real (non-dummy) notes
+    const realIndices = leafIndices.filter((idx) => !dummyIndices.has(idx));
+    const proofPromises = realIndices.map((idx) => this.fetchMerkleProof(idx));
     const proofs = await Promise.all(proofPromises);
 
     const proofMap = new Map<number, { pathElements: bigint[]; pathIndices: number[] }>();
-    for (let i = 0; i < leafIndices.length; i++) {
-      proofMap.set(leafIndices[i], proofs[i]);
+    for (let i = 0; i < realIndices.length; i++) {
+      proofMap.set(realIndices[i], proofs[i]);
+    }
+
+    // Create fake proof for dummy notes (all zeros, depth 16)
+    const TREE_DEPTH = 16;
+    const fakeProof = {
+      pathElements: Array(TREE_DEPTH).fill(0n),
+      pathIndices: Array(TREE_DEPTH).fill(0),
+    };
+    for (const idx of dummyIndices) {
+      proofMap.set(idx, fakeProof);
     }
 
     return {
@@ -742,10 +829,13 @@ export class ShadeClient {
       } {
         const proof = proofMap.get(leafIndex);
         if (!proof) {
-          throw new Error(
-            `Merkle proof not pre-fetched for leaf index ${leafIndex}. ` +
-            `Available indices: ${[...proofMap.keys()].join(", ")}`,
-          );
+          // Return fake proof for dummy/padding notes.
+          // The circuit skips Merkle verification when valueIn[i] == 0,
+          // so the path content doesn't matter.
+          return {
+            pathElements: Array(TREE_DEPTH).fill(0n),
+            pathIndices: Array(TREE_DEPTH).fill(0),
+          };
         }
         return proof;
       },
