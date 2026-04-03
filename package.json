@@ -1,0 +1,30 @@
+{
+  "name": "@shade-protocol/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Shade Protocol privacy system",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.2.1",
+    "@noble/hashes": "^1.7.1",
+    "circomlibjs": "^0.1.7",
+    "ethers": "^6.13.4",
+    "snarkjs": "^0.7.5"
+  },
+  "devDependencies": {
+    "@types/snarkjs": "^0.7.8",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

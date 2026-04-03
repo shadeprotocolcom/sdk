@@ -1,0 +1,303 @@
+import { decryptTransactCiphertext } from "./encryption.js";
+import { computeNullifier, computeCommitment, computeTokenId } from "./notes.js";
+import type {
+  Note,
+  OwnedNote,
+  SyncResult,
+  IndexerCommitmentEvent,
+  IndexerNullifierEvent,
+  OnChainShieldCiphertext,
+  OnChainTransactCiphertext,
+} from "./types.js";
+
+/**
+ * Error thrown when the indexer returns a non-OK response.
+ */
+export class IndexerError extends Error {
+  public readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "IndexerError";
+    this.status = status;
+  }
+}
+
+/**
+ * Raw event as returned by the indexer GET /events endpoint.
+ */
+interface IndexerRawEvent {
+  id: number;
+  blockNumber: number;
+  txHash: string;
+  eventType: string;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Fetch all events from the indexer starting at `fromBlock`.
+ *
+ * The indexer exposes a single `GET /events?from=<blockNumber>` endpoint that
+ * returns Shield, Transact, and Nullified events.  We split them client-side
+ * into commitment and nullifier events.
+ */
+async function fetchEvents(
+  indexerUrl: string,
+  fromBlock: number,
+): Promise<{ commitments: IndexerCommitmentEvent[]; nullifiers: IndexerNullifierEvent[] }> {
+  const url = `${indexerUrl.replace(/\/+$/, "")}/events?from=${fromBlock}`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new IndexerError(
+      `Failed to fetch events: HTTP ${response.status}`,
+      response.status,
+    );
+  }
+
+  const body = (await response.json()) as { events: IndexerRawEvent[] };
+
+  const commitments: IndexerCommitmentEvent[] = [];
+  const nullifiers: IndexerNullifierEvent[] = [];
+
+  for (const event of body.events) {
+    const d = event.data as Record<string, unknown>;
+
+    if (event.eventType === "Shield") {
+      // Shield events store an array of preimages, each with commitment and ciphertext.
+      // The startPosition gives the leafIndex of the first preimage.
+      const preimages = d.preimages as Array<Record<string, unknown>> | undefined;
+      const startPosition = Number(d.startPosition ?? 0);
+
+      if (preimages && Array.isArray(preimages)) {
+        for (let i = 0; i < preimages.length; i++) {
+          const p = preimages[i];
+          if (p.commitment !== undefined && p.ciphertext !== undefined) {
+            commitments.push({
+              blockNumber: event.blockNumber,
+              transactionHash: event.txHash,
+              leafIndex: startPosition + i,
+              commitment: String(p.commitment),
+              eventType: "Shield",
+              ciphertext: p.ciphertext as OnChainShieldCiphertext,
+            });
+          }
+        }
+      }
+    }
+
+    if (event.eventType === "Transact") {
+      // Transact events store hashes[] and ciphertexts[] arrays.
+      // The startPosition gives the leafIndex of the first hash.
+      const hashes = d.hashes as string[] | undefined;
+      const ciphertextData = d.ciphertexts as Array<Record<string, unknown>> | undefined;
+      const startPosition = Number(d.startPosition ?? 0);
+
+      if (hashes && Array.isArray(hashes)) {
+        for (let i = 0; i < hashes.length; i++) {
+          const ct = ciphertextData && i < ciphertextData.length
+            ? ciphertextData[i] as unknown as OnChainTransactCiphertext
+            : null;
+
+          if (ct) {
+            commitments.push({
+              blockNumber: event.blockNumber,
+              transactionHash: event.txHash,
+              leafIndex: startPosition + i,
+              commitment: hashes[i],
+              eventType: "Transact",
+              ciphertext: ct,
+            });
+          }
+        }
+      }
+    }
+
+    if (event.eventType === "Nullified") {
+      // Nullified events store an array of nullifiers
+      const nullifierList = d.nullifiers as string[] | undefined;
+
+      if (nullifierList && Array.isArray(nullifierList)) {
+        for (const nf of nullifierList) {
+          nullifiers.push({
+            blockNumber: event.blockNumber,
+            transactionHash: event.txHash,
+            nullifier: nf,
+          });
+        }
+      } else if (d.nullifier !== undefined) {
+        // Fallback for single nullifier format
+        nullifiers.push({
+          blockNumber: event.blockNumber,
+          transactionHash: event.txHash,
+          nullifier: String(d.nullifier),
+        });
+      }
+    }
+  }
+
+  return { commitments, nullifiers };
+}
+
+/**
+ * Normalize an on-chain nullifier (which may be hex) to a decimal string.
+ * This ensures consistent comparison between SDK-computed nullifiers (decimal)
+ * and indexer-provided nullifiers (hex from on-chain events).
+ */
+function normalizeNullifier(nullifier: string): string {
+  if (nullifier.startsWith("0x") || nullifier.startsWith("0X")) {
+    return BigInt(nullifier).toString();
+  }
+  // If it looks like a hex string without prefix (64 hex chars), try parsing
+  if (/^[0-9a-fA-F]{64}$/.test(nullifier)) {
+    return BigInt("0x" + nullifier).toString();
+  }
+  // Already decimal
+  return nullifier;
+}
+
+/**
+ * Reconstruct a Note from a Shield event's plaintext preimage data.
+ *
+ * Shield events emit the CommitmentPreimage in cleartext, so we can
+ * reconstruct the note directly without needing to decrypt the ciphertext.
+ * However, we can only claim ownership if we know the note's random value,
+ * which is only available through the encrypted ciphertext.
+ *
+ * Since shield ciphertexts only store 96 of 144 bytes (missing the last
+ * 48 bytes of data and the nonce), they cannot be decrypted by recipients
+ * who were not the original shielder. The shielder already knows their own
+ * notes, so shield notes are typically added to the wallet during the
+ * shield() call itself, not during sync.
+ *
+ * For now, we skip shield events during sync. The ShadeClient adds shield
+ * notes to the wallet immediately when shield() is called.
+ */
+function tryDecryptShieldEvent(
+  _event: IndexerCommitmentEvent,
+  _viewingKey: Uint8Array,
+): Note | null {
+  // Shield ciphertexts cannot be fully decrypted from on-chain data alone.
+  // The shielder adds notes to their wallet directly during shield().
+  return null;
+}
+
+/**
+ * Synchronise the local note set against the indexer.
+ *
+ * For every new commitment event the function attempts to decrypt the
+ * ciphertext with the provided viewing key. Successfully decrypted notes
+ * are added to the owned set. Nullifier events mark existing owned notes
+ * as spent.
+ *
+ * @param indexerUrl     Base URL of the indexer API (no trailing slash).
+ * @param viewingKey     32-byte viewing private key.
+ * @param nullifyingKey  The user's nullifying key (for computing note nullifiers).
+ * @param existingNotes  Previously synced owned notes (carried over between calls).
+ * @param lastSyncBlock  Block number of the last successful sync.
+ * @returns              Updated note set, total unspent balance, and latest block.
+ */
+export async function syncBalance(
+  indexerUrl: string,
+  viewingKey: Uint8Array,
+  nullifyingKey: bigint,
+  existingNotes: OwnedNote[],
+  lastSyncBlock: number,
+): Promise<SyncResult> {
+  // Fetch all events from the indexer and split into commitments/nullifiers
+  const { commitments: commitmentEvents, nullifiers: nullifierEvents } =
+    await fetchEvents(indexerUrl, lastSyncBlock);
+
+  // Clone the existing note set so we don't mutate the caller's array
+  const notes: OwnedNote[] = existingNotes.map((n) => ({ ...n }));
+
+  // Build a set of known nullifiers for fast lookup.
+  // Normalize all on-chain nullifiers to decimal strings so they match
+  // the SDK-computed nullifiers (which are bigint.toString() = decimal).
+  const spentNullifiers = new Set<string>(
+    nullifierEvents.map((e) => normalizeNullifier(e.nullifier)),
+  );
+
+  // Track the highest block we've processed
+  let lastBlock = lastSyncBlock;
+
+  // --- Process new commitments ---
+  for (const event of commitmentEvents) {
+    if (event.blockNumber > lastBlock) {
+      lastBlock = event.blockNumber;
+    }
+
+    // Use the correct decryption path based on event type
+    let note: Note | null = null;
+
+    if (event.eventType === "Shield") {
+      note = tryDecryptShieldEvent(event, viewingKey);
+    } else if (event.eventType === "Transact") {
+      note = await decryptTransactCiphertext(
+        event.ciphertext as OnChainTransactCiphertext,
+        viewingKey,
+      );
+    }
+
+    if (note === null) {
+      continue;
+    }
+
+    // Verify the commitment matches what the chain recorded.
+    // Normalize both to decimal for consistent comparison.
+    const expectedCommitment = await computeCommitment(
+      note.npk,
+      note.token,
+      note.value,
+    );
+    const expectedStr = expectedCommitment.toString();
+    const eventStr = normalizeNullifier(event.commitment); // same normalization works for commitments
+    if (expectedStr !== eventStr) {
+      // Commitment mismatch — corrupted event or decryption collision, skip.
+      continue;
+    }
+
+    // Compute the nullifier for this note
+    const nullifier = await computeNullifier(nullifyingKey, event.leafIndex);
+
+    // Use decimal string for nullifier comparison
+    const nullifierStr = nullifier.toString();
+
+    // Skip if we already have a note at this leaf index (e.g. added locally
+    // during shield() before sync picked it up).
+    const alreadyKnown = notes.some((n) => n.leafIndex === event.leafIndex);
+    if (alreadyKnown) {
+      continue;
+    }
+
+    const owned: OwnedNote = {
+      ...note,
+      leafIndex: event.leafIndex,
+      nullifier,
+      spent: spentNullifiers.has(nullifierStr),
+    };
+
+    notes.push(owned);
+  }
+
+  // --- Process nullifier events against all known notes ---
+  for (const event of nullifierEvents) {
+    if (event.blockNumber > lastBlock) {
+      lastBlock = event.blockNumber;
+    }
+  }
+
+  // Mark any previously unspent notes whose nullifier now appears on-chain
+  for (const note of notes) {
+    if (!note.spent && spentNullifiers.has(note.nullifier.toString())) {
+      note.spent = true;
+    }
+  }
+
+  // Compute total unspent balance
+  const balance = notes
+    .filter((n) => !n.spent)
+    .reduce((sum, n) => sum + n.value, 0n);
+
+  return { notes, balance, lastBlock };
+}
