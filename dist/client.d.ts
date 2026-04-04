@@ -6,6 +6,7 @@ export declare class ShadeClient {
     private signer;
     private contract;
     private wcbtcContract;
+    private keyRegistry;
     private keys;
     private ownedNotes;
     private lastSyncBlock;
@@ -18,6 +19,15 @@ export declare class ShadeClient {
      * and nullifying keys.
      */
     connect(signer: ethers.Signer): Promise<void>;
+    /**
+     * Export owned notes as a JSON string for localStorage persistence.
+     */
+    exportNotes(): string;
+    /**
+     * Import previously exported notes (from localStorage).
+     * Merges with existing notes, avoiding duplicates by leafIndex.
+     */
+    importNotes(json: string): void;
     /**
      * Return the master public key derived during connect().
      */
@@ -69,11 +79,10 @@ export declare class ShadeClient {
     unshield(toAddress: string, amount: bigint): Promise<string>;
     private assertConnected;
     /**
-     * Fetch a recipient's registered key data from the indexer.
+     * Fetch a recipient's public keys.
      *
-     * The indexer returns `{ ethAddress, shadePublicKey }` where shadePublicKey
-     * is a JSON string containing the viewing public key (BabyJubjub point)
-     * and the master public key.
+     * Checks the on-chain ShadeKeyRegistry first (trustless). If the recipient
+     * has not self-registered on-chain, falls back to the centralized indexer.
      */
     private fetchRecipientKey;
     /**

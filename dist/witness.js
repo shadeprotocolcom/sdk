@@ -21,13 +21,17 @@ async function padInputNotes(inputNotes, count, keys, tokenAddress, merkleTree) 
         // because tokenId is a 254-bit Poseidon hash, not a 20-byte address.
         const effectiveTokenId = inputNotes.length > 0 ? inputNotes[0].token : tokenAddress;
         const dummyBase = await createDummyNoteWithTokenId(keys.masterPublicKey, effectiveTokenId);
-        // Use a unique dummy leafIndex that cannot collide with real notes.
-        // We pick an index based on the existing input note's leafIndex to guarantee uniqueness.
-        // If real note is at index N, dummy gets N+1 (or max tree index 65535 if no real notes).
+        // Use a RANDOM dummy leafIndex in range [32768, 65535] to avoid nullifier
+        // collisions across transactions. The circuit skips Merkle verification
+        // for zero-value inputs, so the leaf index doesn't need to exist in the tree.
+        // Using the same index (e.g. always 65535) would produce the same nullifier
+        // every time, causing "nullifier already spent" on the second transaction.
         const existingIndices = padded.map((n) => n.leafIndex);
-        let dummyLeafIndex = 65535; // last possible index in depth-16 tree
+        const randomBytes = new Uint8Array(2);
+        globalThis.crypto.getRandomValues(randomBytes);
+        let dummyLeafIndex = 32768 + ((randomBytes[0] * 256 + randomBytes[1]) % 32768);
         while (existingIndices.includes(dummyLeafIndex)) {
-            dummyLeafIndex--;
+            dummyLeafIndex = 32768 + ((dummyLeafIndex - 32768 + 1) % 32768);
         }
         const nullifier = await computeNullifier(keys.nullifyingKey, dummyLeafIndex);
         padded.push({

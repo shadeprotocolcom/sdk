@@ -143,6 +143,7 @@ export interface ShadeConfig {
     rpcUrl: string;
     contractAddress: string;
     wcbtcAddress: string;
+    keyRegistryAddress: string;
     indexerUrl: string;
     proverUrl: string;
 }
