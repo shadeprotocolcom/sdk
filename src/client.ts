@@ -35,6 +35,11 @@ const ERC20_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
 
+const KEY_REGISTRY_ABI = [
+  "function getKeys(address account) external view returns (bytes32, bytes32, bytes32)",
+  "function isRegistered(address account) external view returns (bool)",
+];
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -80,6 +85,7 @@ export class ShadeClient {
   private signer: ethers.Signer | null = null;
   private contract: ethers.Contract | null = null;
   private wcbtcContract: ethers.Contract | null = null;
+  private keyRegistry: ethers.Contract | null = null;
   private keys: ShadeKeys | null = null;
   private ownedNotes: OwnedNote[] = [];
   private lastSyncBlock = 0;
@@ -117,6 +123,11 @@ export class ShadeClient {
       this.config.wcbtcAddress,
       ERC20_ABI,
       signer,
+    );
+    this.keyRegistry = new ethers.Contract(
+      this.config.keyRegistryAddress,
+      KEY_REGISTRY_ABI,
+      this.provider,
     );
 
     // Initial sync
@@ -580,21 +591,37 @@ export class ShadeClient {
   // -----------------------------------------------------------------------
 
   private assertConnected(): void {
-    if (!this.signer || !this.keys || !this.contract || !this.wcbtcContract || !this.provider) {
+    if (!this.signer || !this.keys || !this.contract || !this.wcbtcContract || !this.keyRegistry || !this.provider) {
       throw new Error("ShadeClient is not connected. Call connect() first.");
     }
   }
 
   /**
-   * Fetch a recipient's registered key data from the indexer.
+   * Fetch a recipient's public keys.
    *
-   * The indexer returns `{ ethAddress, shadePublicKey }` where shadePublicKey
-   * is a JSON string containing the viewing public key (BabyJubjub point)
-   * and the master public key.
+   * Checks the on-chain ShadeKeyRegistry first (trustless). If the recipient
+   * has not self-registered on-chain, falls back to the centralized indexer.
    */
   private async fetchRecipientKey(
     ethAddress: string,
   ): Promise<{ viewingPublicKey: string; masterPublicKey: bigint }> {
+    // --- Try on-chain registry first ---
+    try {
+      const [vpkX, vpkY, mpk] = await this.keyRegistry!.getKeys(ethAddress) as [string, string, string];
+
+      if (mpk !== ethers.ZeroHash) {
+        const x = "0x" + BigInt(vpkX).toString(16).padStart(64, "0");
+        const y = "0x" + BigInt(vpkY).toString(16).padStart(64, "0");
+        return {
+          viewingPublicKey: JSON.stringify({ x, y }),
+          masterPublicKey: BigInt(mpk),
+        };
+      }
+    } catch {
+      // On-chain lookup failed (e.g. network error), fall through to indexer
+    }
+
+    // --- Fallback: centralized indexer ---
     const baseUrl = this.config.indexerUrl.replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/keys/${ethAddress}`);
 
@@ -614,7 +641,6 @@ export class ShadeClient {
       shadePublicKey: string;
     };
 
-    // Parse the stored key data (JSON with viewingPublicKey and masterPublicKey)
     const keyData = JSON.parse(data.shadePublicKey) as {
       viewingPublicKey: { x: string; y: string };
       masterPublicKey: string;

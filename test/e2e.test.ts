@@ -35,6 +35,7 @@ const config: ShadeConfig = {
   rpcUrl: "https://rpc.citreascan.com",
   contractAddress: "0x2dDfE129904e3099b69F795e3c1B629c2BBd25E9",
   wcbtcAddress: "0x3100000000000000000000000000000000000006",
+  keyRegistryAddress: "0xDBeF67AaF7c9917a67f6710a611ED80C8326118d",
   indexerUrl: "https://api.shade-protocol.com",
   proverUrl: "https://prover.shade-protocol.com",
 };
